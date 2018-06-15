@@ -73,7 +73,7 @@ PROXY_INFO_UPDATE_PERIOD = getattr(config, "PROXY_INFO_UPDATE_PERIOD", 60*60*24)
 READ_BUF_SIZE = getattr(config, "READ_BUF_SIZE", 16384)
 WRITE_BUF_SIZE = getattr(config, "WRITE_BUF_SIZE", 65536)
 CLIENT_KEEPALIVE = getattr(config, "CLIENT_KEEPALIVE", 60*30)
-AD_TAG = bytes.fromhex(getattr(config, "AD_TAG", ""))
+AD_TAGS = getattr(config, "AD_TAGS", {})
 
 TG_DATACENTER_PORT = 443
 
@@ -105,7 +105,7 @@ TG_MIDDLE_PROXIES_V6 = {
 }
 
 
-USE_MIDDLE_PROXY = (len(AD_TAG) == 16)
+USE_MIDDLE_PROXY = (len(AD_TAGS) > 0)
 
 PROXY_SECRET = bytes.fromhex(
     "c4f9faca9678e6bb48ad6c7e2ce5c0d24430645d554addeb55419e034da62721" +
@@ -359,7 +359,7 @@ class ProxyReqStreamReader(LayeredStreamReaderBase):
 
 
 class ProxyReqStreamWriter(LayeredStreamWriterBase):
-    def __init__(self, upstream, cl_ip, cl_port, my_ip, my_port):
+    def __init__(self, upstream, cl_ip, cl_port, my_ip, my_port, ad_tag):
         self.upstream = upstream
 
         if ":" not in cl_ip:
@@ -377,6 +377,8 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
         self.our_ip_port += int.to_bytes(my_port, 4, "little")
         self.out_conn_id = bytearray([random.randrange(0, 256) for i in range(8)])
 
+        self.ad_tag = ad_tag
+
     def write(self, msg):
         RPC_PROXY_REQ = b"\xee\xf1\xce\x36"
         FLAGS = b"\x08\x10\x02\x40"
@@ -391,7 +393,7 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
         full_msg = bytearray()
         full_msg += RPC_PROXY_REQ + FLAGS + self.out_conn_id + self.remote_ip_port
         full_msg += self.our_ip_port + EXTRA_SIZE + PROXY_TAG
-        full_msg += bytes([len(AD_TAG)]) + AD_TAG + FOUR_BYTES_ALIGNER
+        full_msg += bytes([len(self.ad_tag)]) + self.ad_tag + FOUR_BYTES_ALIGNER
         full_msg += msg
 
         return self.upstream.write(full_msg)
@@ -402,6 +404,7 @@ async def handle_handshake(reader, writer):
 
     for user in USERS:
         secret = bytes.fromhex(USERS[user])
+        ad_tag = bytes.fromhex(AD_TAGS[user]) if user in AD_TAGS else ""
 
         dec_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN]
         dec_prekey, dec_iv = dec_prekey_and_iv[:PREKEY_LEN], dec_prekey_and_iv[PREKEY_LEN:]
@@ -423,7 +426,7 @@ async def handle_handshake(reader, writer):
 
         reader = CryptoWrappedStreamReader(reader, decryptor)
         writer = CryptoWrappedStreamWriter(writer, encryptor)
-        return reader, writer, user, dc_idx, enc_key + enc_iv
+        return reader, writer, user, dc_idx, enc_key + enc_iv, ad_tag
     return False
 
 
@@ -531,7 +534,7 @@ def set_bufsizes(sock, recv_buf=READ_BUF_SIZE, send_buf=WRITE_BUF_SIZE):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buf)
 
 
-async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
+async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port, ad_tag):
     START_SEQ_NO = -2
     NONCE_LEN = 16
 
@@ -656,7 +659,7 @@ async def do_middleproxy_handshake(dc_idx, cl_ip, cl_port):
     if handshake_type != RPC_HANDSHAKE or handshake_peer_pid != SENDER_PID:
         return False
 
-    writer_tgt = ProxyReqStreamWriter(writer_tgt, cl_ip, cl_port, my_ip, my_port)
+    writer_tgt = ProxyReqStreamWriter(writer_tgt, cl_ip, cl_port, my_ip, my_port, ad_tag)
     reader_tgt = ProxyReqStreamReader(reader_tgt)
 
     return reader_tgt, writer_tgt
@@ -671,18 +674,19 @@ async def handle_client(reader_clt, writer_clt):
         writer_clt.transport.abort()
         return
 
-    reader_clt, writer_clt, user, dc_idx, enc_key_and_iv = clt_data
+    reader_clt, writer_clt, user, dc_idx, enc_key_and_iv, ad_tag = clt_data
+    HAS_AD_TAG = (len(ad_tag) == 16)
 
     update_stats(user, connects=1)
 
-    if not USE_MIDDLE_PROXY:
+    if not USE_MIDDLE_PROXY and not HAS_AD_TAG:
         if FAST_MODE:
             tg_data = await do_direct_handshake(dc_idx, dec_key_and_iv=enc_key_and_iv)
         else:
             tg_data = await do_direct_handshake(dc_idx)
     else:
         cl_ip, cl_port = writer_clt.upstream.get_extra_info('peername')[:2]
-        tg_data = await do_middleproxy_handshake(dc_idx, cl_ip, cl_port)
+        tg_data = await do_middleproxy_handshake(dc_idx, cl_ip, cl_port, ad_tag)
 
     if not tg_data:
         writer_clt.transport.abort()
@@ -690,7 +694,7 @@ async def handle_client(reader_clt, writer_clt):
 
     reader_tg, writer_tg = tg_data
 
-    if not USE_MIDDLE_PROXY and FAST_MODE:
+    if not USE_MIDDLE_PROXY and not HAS_AD_TAG and FAST_MODE:
         class FakeEncryptor:
             def encrypt(self, data):
                 return data
@@ -702,7 +706,7 @@ async def handle_client(reader_clt, writer_clt):
         reader_tg.decryptor = FakeDecryptor()
         writer_clt.encryptor = FakeEncryptor()
 
-    if USE_MIDDLE_PROXY:
+    if USE_MIDDLE_PROXY and HAS_AD_TAG:
         reader_clt = MTProtoCompactFrameStreamReader(reader_clt)
         writer_clt = MTProtoCompactFrameStreamWriter(writer_clt)
 
